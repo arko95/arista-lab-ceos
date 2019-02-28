@@ -1,0 +1,12 @@
+---
+- hosts: all
+  gather_facts: no
+  tasks:
+
+    - name: gather version
+      eos_facts:
+        gather_subset:
+          - "!hardware"
+      register: result
+    - debug:
+         var=ansible_net_version

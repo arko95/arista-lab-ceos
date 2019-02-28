@@ -1,0 +1,708 @@
+#!/home/pedro/testdir/bin/python3
+import argparse
+import logging
+import yaml
+import os
+import sys
+import docker
+import os.path
+import netaddr
+import subprocess
+from pyroute2 import IPDB
+from pyroute2 import netns
+from pyroute2 import NetNS
+from distutils.version import LooseVersion
+
+# Global constants
+LOG = logging.getLogger(__name__)
+DOCKER = docker.from_env()
+netns.NETNS_RUN_DIR = "/var/run/docker/netns"
+SUPPORTED_DRIVERS = ['macvlan', 'bridge', 'veth']
+DEVNULL = open(os.devnull, 'w')
+CVP_MEM_MAX = "7g" # 6GB in bytes
+CVP_MEMSWAP_MAX = "7g"
+
+# Global variables
+VERSION = 1
+CEOS_IMAGE = 'ceos:latest'
+CONF_DIR = './config'
+PUBLISH_BASE = 8000
+OOB_PREFIX = '192.168.100.0/24'
+PREFIX = 'CEOS-LAB'
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Tool to create cEOS topologies")
+    parser.add_argument(
+        '-d', '--debug',
+        help='Enable Debug',
+        action='store_true'
+    )
+    
+    m_group = parser.add_argument_group(title="Actions", description="Create or destroy topology")
+    main_group = m_group.add_mutually_exclusive_group()
+    main_group.add_argument(
+        "--create",
+        help="Create topology",
+        action="store_true"
+    )
+    main_group.add_argument(
+        "--destroy",
+        help="Destroy topology",
+        action="store_true"
+    )
+
+    save_group = parser.add_argument_group(title="Save", description="Save or archive the topology")
+    save_group.add_argument(
+        "-s", "--save",
+        help="Save topology configs",
+        action="store_true"
+    )
+    save_group.add_argument(
+        "-a", "--archive",
+        help="Archive topology file and configs",
+        action="store_true"
+    )
+
+    parser.add_argument(
+        "topology",
+        help='Topology file',
+        type=str
+    )
+    args = parser.parse_args()
+    return args
+
+
+def run_cmd(command, sudo=False):
+    if sudo:
+        sudo_prefix = 'sudo '
+    else:
+        sudo_prefix = ''
+    cmd = sudo_prefix + command
+    LOG.debug("Running command: {}".format(cmd))
+    output = None if LOG.getEffectiveLevel() == logging.DEBUG else DEVNULL
+    return subprocess.call(cmd, shell=True, stdout=output, stderr=output)
+
+def write_file(filename, text):
+    if os.path.exists(filename):
+        LOG.debug("Filename {} exists, overwriting".format(filename))
+    else:
+        LOG.debug("Creating new file {}".format(filename))
+    with open(filename, 'w') as f:
+        f.write(text)
+
+def archive_topo(confdir, topofile):
+    LOG.debug("Archiving {} and {}".format(confdir, topofile))
+    outfile = os.path.splitext(topofile)[0] + '.tar.gz'
+    confdir = os.path.basename(confdir)
+    import tarfile
+    with tarfile.open(outfile, 'w:gz') as tar:
+        tar.add(confdir)
+        tar.add(topofile)
+    return outfile
+
+def enable_lldp(networks):
+    for each in networks:
+        try:
+            cmd = 'echo 16384 > /sys/class/net/br-{}/bridge/group_fwd_mask'.format(each.network.id[:12])
+            run_cmd(cmd, True)
+        except:
+            continue
+    return
+
+def enable_ipForwarding(devices):
+    [d.container.exec_run("sysctl -w net.ipv4.ip_forward=1") for _,d in devices.items()]
+
+def kill_agetty():
+    cmd = 'pkill agetty'
+    run_cmd(cmd, True)
+    return
+
+
+def parse_endpoints(devices, endpoints, link, idx):
+    """
+    Parses a single endpoints list in the format:
+    ["Device-A:Interface-1", "cvp-1", "host-1", "host-2:Eth1", "host-3:Eth2:192.168.10.30/24"]
+    Updates devices dictionary
+    """
+    for endpoint in endpoints:
+        # Example: ep == "host-3:Eth2:192.168.10.30/24"
+        ep = endpoint.split(':')
+        # Example: ep == ["host-3", "Eth2", "192.168.10.30/24"]
+        if not ep:
+            LOG.error('Link contains empty definition')
+        device_name = ep.pop(0)
+        # Example: device_name == "host-3"
+        # We only support CVP, Host and CEOS device types
+        if 'cvp' in device_name.lower():
+            # The below is dict.get(key, default) 
+            device = devices.get(device_name, CVP(device_name))
+        elif 'host' in device_name.lower():
+            # Example: ep == ["Eth2","192.168.10.30/24"]
+            device = devices.get(device_name, Host(device_name))
+            if len(ep) > 1:
+                # This means we have intf name _AND_ IP address
+                ip = ep.pop()
+                device.add_ip(ip, ep[0])            
+        else:
+            # This creates default CEOS device type
+            device = devices.get(device_name, CEOS(device_name))
+        if ep:
+            int_name = ep.pop()
+        else:
+            # ep is None, meaning endpoint was defined without
+            # interface name, like "host-2"
+            int_name = 'eth{}'.format(idx)
+        # Remember device connections
+        device.connect(int_name, link)
+        devices[device_name] = device   
+
+def parse_v1(t_yml):
+    """
+    Reads the topology definition in the following format:
+    links:
+      - ["Device-A:Interface-1", "Device-B:Interface-3"]
+      - ["Device-A:Interface-1", "cvp-1", "host-1", "host-2:Eth1", "host-3:Eth2:192.168.10.30/24"]
+    Returns a dict of devices and a list links
+    """
+    devices = dict()
+    links = list()
+    for idx, link_dsc in enumerate(t_yml['links']):
+        # Example: link_dsc == ["Device-A:Interface-1", "cvp-1", "host-1", "host-3:Eth2:192.168.10.30/24"]
+        if len(link_dsc) == 2:
+            # Example: link_dsc == ["Device-A:Interface-1", "cvp-1"]
+            link_type = 'p2p'
+        else:
+            # Example: link_dsc == ["Device-A:Interface-1", "cvp-1", "host-1"]
+            link_type = 'mpoint'
+        link = Link(link_type, 'net-{}'.format(idx))
+        links.append(link)
+        parse_endpoints(devices, link_dsc, link, idx)
+    return devices, links
+
+def parse_v2(t_yml):
+    """
+    Reads the topology definition in the following format:
+    links:
+      - driver: macvlan (Optional)
+        driver_opts: (Optional)
+          parent: eth0
+        endpoints: ["Device-A:Interface-1", "Device-B:Interface-3"]
+      - endpoints:
+          - Device-A:Interface-1
+          - cvp-1
+          - host-1
+          - host-2:Eth1
+          - host-3:Eth2:192.168.10.30/24
+    Returns a dict of devices and a list of links
+    """
+    devices = dict()
+    links = list()
+    for idx, link_dsc in enumerate(t_yml['links']):
+        # Example: link_dsc == {'driver': 'macvlan', 'driver_opts': {'parent': 'eth1'},
+        # endpoints: ["Device-A:Interface-1", "cvp-1", "host-1", "host-3:Eth2:192.168.10.30/24"]}
+        LOG.debug("parsing link {}".format(link_dsc))
+        # Link-specific driver takes priority over topology-specific 
+        link_driver = link_dsc.get('driver', t_yml.get('driver', None))
+        driver_opts = link_dsc.get('driver_opts', None)
+        link_endpoints = link_dsc.get('endpoints', None)
+        if not link_endpoints:
+            LOG.error("Missing endpoints definition")
+        else:
+            LOG.debug("parsing endpoints {}".format(link_endpoints))
+        if len(link_endpoints) <= 2:
+            # Example: link_dsc == ["Device-A:Interface-1", "cvp-1"]
+            link_type = 'p2p'
+        else:
+            # Example: link_dsc == ["Device-A:Interface-1", "cvp-1", "host-1"]
+            link_type = 'mpoint'
+        link = Link(link_type, 'net-{}'.format(idx), link_driver, driver_opts)
+        links.append(link)
+        parse_endpoints(devices, link_endpoints, link, idx)
+    return devices, links
+
+class Device(object):
+    def __init__(self, name):
+        LOG.debug('\tConstructing device {}'.format(name))
+        self.name = '_'.join([PREFIX, name])
+        # Setting up defaults
+        self.type = ''
+        self.image = ''
+        self.command = ''
+        self.environment = dict()
+        self.pid = None
+        self.sandbox = None
+        self.default_network = None
+        self.start_mode = None
+        self.sysctls = {'net.ipv4.ip_forward': 1}
+        self.entry_cmd = 'docker exec -it {} sh'.format(self.name)
+        # Setting up extra variables
+        self.interfaces = dict()
+        self.volumes = dict()
+        self.ports = dict()
+        # Pointer to docker SDK object
+        self.container = None
+
+    def _update_start_mode(self, interface, link):
+        new_start_mode = 'manual' if link.driver == 'veth' else 'auto'
+        LOG.debug("\tUpdating start_mode from {} to {}".format(self.start_mode, new_start_mode))
+        if not self.start_mode:
+            self.start_mode = new_start_mode
+            if self.start_mode == 'manual':
+                self.default_network = 'none'
+            else:
+                # Popping the current interface from the list 
+                self.interfaces.pop(interface)
+                # Default network now points to the new link
+                self.default_network = link.name
+            LOG.debug("\tDefault network is set to {}".format(self.default_network))
+        elif self.start_mode == 'auto' and new_start_mode == 'manual':
+            self.start_mode = 'manual'
+        
+
+    def _get_or_create(self):
+        LOG.debug('\tObtaining a pointer to container {}'.format(self.name))
+        # Checking if container already exists
+        self.container = self.get()
+        # If doesn't exist creating a new container
+        if not self.container:
+            self.container = self._create()
+        return
+    
+    def _update(self):
+        self.container = self.get()
+    
+    def _create(self):
+        return DOCKER.containers.create(
+                self.image,
+                command=self.command,
+                environment=self.environment,
+                volumes=self.volumes,
+                network=self.default_network,
+                privileged=True,
+                name=self.name,
+                detach=True,
+                hostname=self.name,
+                ports=self.ports,
+                sysctls=self.sysctls,
+                labels={PREFIX: self.name},
+                tty=True
+            )
+
+    def get(self):
+        try:
+            return DOCKER.containers.get(self.name)
+        except docker.errors.NotFound:
+            return None
+
+    def start(self):
+        LOG.debug('\tStarting container {}'.format(self.name))
+
+        if not self.container:
+            self._get_or_create()
+        if self.container.status == 'running':
+            LOG.info('Container {} already running'.format(self.name))
+            return 1
+        if self.start_mode == 'auto':
+            self._attach()
+            self.container.start()
+        elif self.start_mode == 'manual':
+            self.container.start()
+            self._update()
+            self.pid = self.container.attrs.get('State', {}).get('Pid', None)
+            LOG.debug('\tPID for container {} is {}'.format(self.name, self.pid))
+            self.sandbox = self.container.attrs.get('NetworkSettings', {}).get('SandboxKey', None)
+            LOG.debug('\tSandbox key for container {} is {}'.format(self.name, self.pid))
+            self.container.pause()
+            self._attach()
+            self.container.unpause()
+        else:
+            LOG.info('Unsupported container start mode {}'.format(self.start_mode))
+        return 0
+
+    def connect(self, interface, link):
+        LOG.debug('\tCreating a pointer to network {} for interface {}'.format(link.name, interface))
+        self.interfaces[interface] = link
+        self._update_start_mode(interface, link)
+        return
+
+    def _attach(self):
+        for interface in sorted(self.interfaces):
+            LOG.debug('\tAttaching container {} interface {} to its link'
+                      .format(self.name, interface))
+            link = self.interfaces[interface]
+            link.connect(self, interface)
+        return
+
+    def kill(self):
+        LOG.debug('\tKilling container {}'.format(self.name))
+        if not self.container:
+            self._get_or_create()
+        
+        if self.container.status not in ['running', 'paused']:
+            LOG.info('Container {} is not running'.format(self.name))
+            DOCKER.containers.prune(
+                filters={'label': PREFIX}
+            )
+            return 1
+        self.container.kill()
+        return 0
+
+    def publish_port(self, inside, outside):
+        LOG.debug("Publishing {}'s port {} to {}".format(self.name, inside, outside))
+        self.ports[inside] = outside
+    
+    def write_mem(self, filename):
+        raise NotImplementedError("Save is only implemented for cEOS device type")
+
+class CEOS(Device):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Overriding defaults
+        self.type = 'ceos'
+        self.image = CEOS_IMAGE
+        self.command = "/sbin/init"
+        ceos_version = self.image.split(":")[-1]
+        # This assumes that docker image tag contains the correct EOS version, e.g. ceos:4.20.5
+        if ceos_version == "4.20.5F":
+            eos_platform = "ceossim"
+        else:
+            eos_platform = "ceoslab"
+        self.environment = {
+                               "CEOS": 1,
+                               "EOS_PLATFORM": eos_platform,
+                               "container": "docker",
+                               "ETBA": 1,
+                               "SKIP_ZEROTOUCH_BARRIER_IN_SYSDBINIT": 1,
+                               "INTFTYPE": "eth"
+                           }
+        self.entry_cmd = 'docker exec -it {} Cli'.format(self.name)
+        # Overriding extra variables
+        self.volumes = self._get_config()
+
+    def _get_config(self):
+        startup = os.path.join(CONF_DIR, self.name)
+        # Docker requires absolute path in volumes
+        startup = os.path.abspath(startup)
+        if os.path.isfile(startup):
+            return {startup: {
+                            'bind': "/mnt/flash/startup-config",
+                            'mode': 'rw'}
+                    }
+        else:
+            return {}
+
+    def write_mem(self, filename):
+        LOG.debug("Saving container config into {}".format(filename))
+        if not self.container:
+            self._get_or_create()
+        
+        if self.container.status not in ['running', 'paused']:
+            LOG.info('Container {} is not running'.format(self.name))
+            return 1
+        else:
+            _, output = self.container.exec_run("Cli -p 15 -c \"show running\"", tty=True)
+            write_file(filename, output.decode("utf-8"))
+            return 0
+
+class Host(Device):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Overriding defaults
+        self.type = 'host'
+        self.image = 'alpine-host:latest'
+        # CMD will contain a list of IPs to assign to interfaces
+        self.command = []
+
+    @staticmethod
+    def _verify_addr(ip):
+        prefix = netaddr.IPNetwork(ip)
+        return prefix.prefixlen < 32
+
+    def add_ip(self, ip, intf):
+        LOG.debug("Adding IP address command line argument for IP {}".format(ip))
+        if self._verify_addr(ip):
+            self.command.append(':'.join([intf, ip]))
+
+    def start(self, *args, **kwargs):
+        super().start(*args, **kwargs)
+        if self.start_mode == 'manual':
+        # This is to fix the scripts who assign IPs in entrypoint
+            LOG.debug("Running set_ips script")
+            rc, output = self.container.exec_run("/set_ips.sh")
+            LOG.debug("RC = {}, output = {}".format(rc, output))
+        return 0
+
+class CVP(Device):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Overriding defaults
+        self.type = 'cvp'
+        self.image = 'cvp:latest'
+        self.ports = {'443/tcp': 443}
+        self.prefix = OOB_PREFIX
+        self.command = self._get_ip_mask()
+        self.entry_cmd = 'docker exec -it {} bash'.format(self.name)
+
+    def start(self, *args, **kwargs):
+        rc = super().start(*args, **kwargs)
+        LOG.debug("Setting CVP max memory utilisation")
+        self.container.update(mem_limit=CVP_MEM_MAX, memswap_limit=CVP_MEMSWAP_MAX)
+        return rc
+
+    def _get_ip_mask(self):
+        prefix = netaddr.IPNetwork(self.prefix)
+        # Giving CVP the last IP from the OOB subnet
+        return [str(prefix[-2]), str(prefix.netmask)]
+
+    def publish_port(self, *args, **kwargs):
+        raise NotImplementedError("Can't publish ports for {}".format(self.__class__))
+
+
+class Veth(object):
+    def __init__(self, name):
+        self.name = name
+        self.ipdb = IPDB()
+        self.sideA = "{}-a".format(name)
+        self.sideB = "{}-b".format(name)
+
+    def _create(self):
+        return self.ipdb.create(ifname=self.sideA, kind='veth', peer=self.sideB).commit()
+         
+    def _get(self, intf):
+        return self.ipdb.interfaces.get(intf)
+
+    def connect(self, device, interface):
+        ns_fd = os.open('/proc/{}/ns/net'.format(device.pid), os.O_RDONLY) 
+        veth = self._get(self.sideB)
+        if not veth:
+            self._create()
+            veth = self._get(self.sideA)
+        LOG.debug("Connecting {} to {}".format(veth.ifname, device.name))
+        with veth as i:
+            i.ifname = interface
+            i.net_ns_fd = ns_fd
+            i.up()
+            # TODO Could add veth.add_ip('1.1.1.1/24') and get rid of set_ips.sh script
+            LOG.debug("Create an interface for container {}: {}".format(device.name, i.review()))
+        ns_name = device.sandbox.split('/')[-1]
+        with IPDB(nl=NetNS(ns_name)) as ns:
+            with ns.interfaces[interface] as i:
+                i.up()
+ 
+
+class Link(object):
+    def __init__(self, link_type, name, link_driver=None, driver_opts=None):
+        LOG.debug('\tConstructing a {} link with name {}'.format(link_type, name))
+        self.name = '_'.join([PREFIX, name])
+        self.link_type = link_type
+        self.network = None
+        self.opts = driver_opts if driver_opts else {}
+
+        if link_driver:
+            self.driver = link_driver
+        else:
+            self.driver = 'bridge'
+        LOG.debug('\t\tThe driver to be used for link {} is {}'.format(name, link_driver))
+
+        if link_type == 'mpoint' and self.driver == 'veth':
+            LOG.error('\t\tVeth driver is not supported with multipoint links')
+        
+        if not self.driver in SUPPORTED_DRIVERS:
+            LOG.error("\t\tUnsupported link driver {}".format(link_driver))
+
+        self.get_or_create()
+
+    def get_or_create(self):
+        LOG.debug('\tObtaining a pointer to network {}'.format(self.name))
+        self.network = self._get()
+        if not self.network:
+            self.network = self._create()
+        return self.network
+
+    def _create(self):
+        LOG.debug('\tCreating a new network {} of type {}'.format(self.name, self.driver))
+        return DOCKER.networks.create(
+                self.name,
+                driver=self.driver,
+                labels={PREFIX: self.name},
+                options=self.opts
+            )
+
+    def _get(self):
+        LOG.debug("Trying to find an existing network with name {}".format(self.name))
+        if self.driver == 'veth':
+            return Veth(self.name)
+        try:
+            return DOCKER.networks.get(self.name)
+        except docker.errors.NotFound:
+            LOG.debug("Network {} not found".format(self.name))
+            return None
+
+    def connect(self, device, interface):
+        LOG.debug('\tConnecting {}-type link to {}'.format(self.driver, device.name))
+        if not self.network:
+            self.get_or_create()
+        if self.driver == 'veth':
+            self.network.connect(device, interface)
+        else:
+            self.network.connect(device.container)
+    
+    def kill(self):
+        if self.driver == 'veth':
+            pass
+
+def main():
+    # Initializing main variables
+    global PREFIX, CEOS_IMAGE, CONF_DIR, PUBLISH_BASE, OOB_PREFIX, VERSION, PUBLISH_SSH
+    
+    # Assigning arguments
+    args    = parse_args()
+    debug   = args.debug
+    create  = args.create
+    save    = args.save
+    tar     = args.archive
+    t_file  = os.path.join(os.getcwd(), args.topology)
+    t_fn    = os.path.split(args.topology)[-1]
+    destroy = args.destroy
+    PREFIX  = t_fn.split('.')[0]
+
+    # Logging settings
+    if debug:
+        log_level = logging.DEBUG
+    else:
+        log_level = logging.INFO
+    logging.basicConfig(level=log_level)
+
+    # Loading topology YAML file
+    with open(t_file, 'r') as stream:
+        t_yml = yaml.load(stream)
+    LOG.debug("Loaded topology from YAML file {}\n {}"
+                 .format(t_file, yaml.dump(t_yml)))
+    if 'links' not in t_yml:
+        LOG.info('"links" dictionary is not found in {}'
+                    .format(t_file))
+        return 1
+
+    # Loading optional variables
+    # First check if it's specified in topoology.yml
+    # Then check if it's an env variable, last accept default
+    CEOS_IMAGE = t_yml.get('CEOS_IMAGE', os.getenv('CEOS_IMAGE', CEOS_IMAGE))
+    CONF_DIR = t_yml.get('CONF_DIR',os.getenv('CONF_DIR', CONF_DIR))
+    PUBLISH_BASE = t_yml.get('PUBLISH_BASE', os.getenv('PUBLISH_BASE', PUBLISH_BASE))
+    OOB_PREFIX = t_yml.get('OOB_PREFIX',os.getenv('OOB_PREFIX', OOB_PREFIX))
+    VERSION = int(t_yml.get('VERSION',os.getenv('VERSION', VERSION)))
+    PREFIX = t_yml.get('PREFIX',os.getenv('PREFIX', PREFIX))
+
+    if VERSION == 2 and os.geteuid() != 0:
+        LOG.info("Version 2 requires sudo. Restarting script with sudo")
+        os.execvp("sudo", ["sudo"] + sys.argv)
+
+    # Versioned parsing logic
+    if VERSION == 1:
+        devices, links = parse_v1(t_yml)
+    elif VERSION == 2:
+        devices, links = parse_v2(t_yml)
+    else:
+        LOG.error("Specified version {} is not supported".format(VERSION))
+        return 1
+    
+    LOG.debug("PUBLISH_BASE is {} of type {}".format(PUBLISH_BASE, type(PUBLISH_BASE)))
+    # We're only publishing ceos ports, not host or cvp
+    ceos_only = [k for k in devices.keys() if devices[k].type == 'ceos']
+    # Publishing ports. If type is INT assuming default behaviour which is
+    # Single mapping of inside 443 to outside PUBLISH_BASE+index
+    if PUBLISH_BASE and (type(PUBLISH_BASE) == int):
+        LOG.debug("Publish internal port 443 -> base {}".format(PUBLISH_BASE))
+        base = int(PUBLISH_BASE)
+        # Sort all device names alphabetically
+        for idx,name in enumerate(sorted(ceos_only)):
+            # Publish internal HTTPS port to external base
+            devices[name].publish_port('443/tcp',base+idx)
+    # The second case is when PUBLISH_BASE is a dict, in which case
+    # Each element is a mapping: INTERNAL:EXTERNAL, where
+    # INTERNAL is 'PORT/PROTO', e.g. '443/tcp' and
+    # EXTERNAL is either an INTEGER, e.g. 8000 or None (random port)
+    # Or a list with two elements [EXTERNAL_IP, EXTERNAL_PORT]
+    # similar to http://docker-py.readthedocs.io/en/stable/containers.html
+    # Example: PUBLISH_BASE: {443/tcp:[127.0.0.1,4343]}
+    # Example: PUBLISH_BASE: {443/tcp:8000}
+    # Example: PUBLISH_BASE: {443/tcp:None}
+    elif type(PUBLISH_BASE) == dict:
+        for inside,outside in PUBLISH_BASE.items():
+            LOG.debug("Publish internal port {} -> {} (type {})".format(inside, outside, type(outside)))
+            # Sort all device names alphabetically
+            for idx,name in enumerate(sorted(ceos_only)):
+                # If it's a list, increment the second element
+                if type(outside) == list:
+                    external = (outside[0], outside[1]+idx)
+                # If it's an int, simply increment
+                elif type(outside) == int:
+                    external = outside + idx
+                # Else it must be None
+                else:
+                    external = None
+                devices[name].publish_port(inside,external)
+        
+    # Main logic
+    if create:
+        started = [device.start() == 0 for (name, device) in devices.items()]
+        
+        LOG.info(''.join(["\nalias {}='{}'".format(name, device.entry_cmd) for (name, device) in devices.items()]))
+
+        if all(started):
+            LOG.info('All devices started successfully')
+            LOG.debug('Enabling LLDP forwarding on Docker bridges')
+            enable_lldp(links)
+            LOG.debug('Enabling IP forwarding inside all containers')
+            enable_ipForwarding(devices)
+        else:
+            LOG.info('Devices have not been started')
+            return 1
+    elif destroy:
+        killed = [device.kill() == 0 for (name, device) in devices.items()]
+        # Regardless of whether we killed or not, try to prune unused objects
+        DOCKER.networks.prune(
+            filters={'label': PREFIX}
+        )
+        DOCKER.containers.prune(
+            filters={'label': PREFIX}
+        )
+        LOG.info(''.join(['\nunalias {}'.format(name) for (name, device) in devices.items()]))
+        kill_agetty()
+
+        if all(killed):
+            LOG.info('All devices destroyed successfully')  
+        else:
+            LOG.info('Devices have not been destroyed')
+            return 1
+    
+    if save:
+        # Hard-coding to CONF_DIR. Don't think that a flexible option is needed
+        dirname = CONF_DIR
+        if os.path.exists(dirname):
+            ok = input('Config directory exists, existing files may be overwritten. Continue? [y/n]:')
+        else:
+            os.mkdir(dirname)
+            ok = 'y'
+        if ok == 'y':
+            saved = [device.write_mem(os.path.join(dirname, device.name)) == 0 for (name, device) in devices.items() if device.type == 'ceos']
+            if all(saved):
+                LOG.info("All configs saved in {}".format(dirname))
+            else:
+                LOG.info("Some configs have not been saved")
+                return 1
+        else:
+            LOG.info("Save interrupted")
+
+    if tar:
+        if not os.path.exists(CONF_DIR):
+            os.mkdir(CONF_DIR)
+        arch_fn = archive_topo(CONF_DIR, t_fn)
+        LOG.info("Archive file {} created".format(arch_fn))
+
+    return 0
+        
+
+
+if __name__ == '__main__':
+    main()

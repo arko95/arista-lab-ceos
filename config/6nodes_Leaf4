@@ -1,0 +1,25 @@
+! Command: show running-config
+! device: Leaf4-SW (cEOSLab, EOS-4.21.2F-10430819.4212F (engineering build))
+!
+transceiver qsfp default-mode 4x10G
+!
+hostname Leaf4-SW
+!
+spanning-tree mode mstp
+!
+no aaa root
+!
+username arista privilege 15 secret sha512 $6$r0ddfVOL0YifQTdG$S4INoGtCB6QXUhIFY5QTknqc7AoaUxiNvoRl7mRXHcJXMaeg73Sy8TgmD7rdGIUiXBsGF3QZKY1KQf42m2xiY.
+!
+interface Ethernet1
+!
+interface Ethernet2
+!
+interface Ethernet3
+!
+no ip routing
+!
+management api http-commands
+   no shutdown
+!
+end
