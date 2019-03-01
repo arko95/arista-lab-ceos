@@ -1,0 +1,5 @@
+vlans:
+  - vlanid: 100
+    name: admin
+
+eos_purge_vlans: true

@@ -1,0 +1,7 @@
+vlans:
+  - vlanid: 10
+    name: test
+  - vlanid: 20
+    name: production
+
+eos_purge_vlans: true

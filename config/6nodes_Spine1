@@ -11,6 +11,9 @@ no aaa root
 !
 username arista privilege 15 secret sha512 $6$oBYkO8vleBAUYx8p$FWM8vd24j4mLfoGBsd0HF7s4BNSiWZJjzCpG2jdi5o4GZCXX/akJ2r0/1rWnFvNleEc1qo6eDecZZJTyOydbY/
 !
+vlan 100
+   name admin
+!
 interface Ethernet1
 !
 interface Ethernet2

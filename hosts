@@ -1,14 +1,16 @@
 
 [leafs]
-Leaf1 ansible_httpapi_port=8000 ansible_host=127.0.0.1
-Leaf2 ansible_httpapi_port=8001 ansible_host=127.0.0.1
-Leaf3 ansible_httpapi_port=8002 ansible_host=127.0.0.1
-Leaf4 ansible_httpapi_port=8003 ansible_host=127.0.0.1
+Leaf1 ansible_port=2000 ansible_host=127.0.0.1
+Leaf2 ansible_port=2001 ansible_host=127.0.0.1
+Leaf3 ansible_port=2002 ansible_host=127.0.0.1
+Leaf4 ansible_port=2003 ansible_host=127.0.0.1
 
 [leafs:vars]
-ansible_connection=httpapi
+ansible_connection=network_cli
 ansible_network_os=eos
 ansible_user=arista
+ansible_become=yes
+ansible_become_method=enable
 
 [spines]
 Spine1 ansible_httpapi_port=8004 ansible_host=127.0.0.1 
@@ -19,6 +21,8 @@ Spine2 ansible_httpapi_port=8005 ansible_host=127.0.0.1
 ansible_connection=httpapi
 ansible_network_os=eos
 ansible_user=arista
+ansible_become=yes
+ansible_become_method=enable
 
 [network:children]
 spines
