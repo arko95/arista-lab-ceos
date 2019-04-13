@@ -1,5 +1,5 @@
 vlans:
-  - vlanid: 100
-    name: admin
+  - vlanid: 1
+    name: default
 
 eos_purge_vlans: true
