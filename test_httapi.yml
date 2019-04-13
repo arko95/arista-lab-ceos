@@ -1,0 +1,15 @@
+---
+- hosts: Spine1
+  gather_facts: false
+  tasks:
+
+    - name: type a simple arista command
+      eos_command:
+        commands:
+          - show running-config 
+      register: command_output
+
+    - name: print command output to terminal window
+      copy:
+        content: "{{ command_output.stdout[0] }}"
+        dest: "{{inventory_hostname}}.cfg"
