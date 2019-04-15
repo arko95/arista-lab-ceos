@@ -1,5 +1,5 @@
 ! Command: show running-config
-! device: Leaf1-SW (cEOSLab, EOS-4.21.2F-10430819.4212F (engineering build))
+! device: Leaf1-SW (cEOSLab, EOS-4.21.5F)
 !
 transceiver qsfp default-mode 4x10G
 !

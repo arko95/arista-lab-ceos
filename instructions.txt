@@ -1,0 +1,20 @@
+#Start the lab
+
+cd Repos/ceoslab
+source bin/activate
+cd arista-lab-ceos
+docker-topo --create 6nodes.yml
+
+#Check
+sudo docker ps
+
+#Save the configs
+docker-topo -s 6nodes.yml
+
+#Finish the lab
+docker-topo --destroy 6nodes.yml
+
+#Commit changes
+
+#Deactivate the virtualenv
+deactivate

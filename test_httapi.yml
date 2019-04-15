@@ -11,7 +11,7 @@
 
     - name: print command output to terminal window
       debug:
-        var: command_output.stdout[0]["version"]
+        var: command_output.stdout[0]
 
     - name: save result to a file 
       copy:
