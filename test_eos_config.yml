@@ -1,0 +1,11 @@
+---
+- hosts: all
+  gather_facts: false
+  tasks:
+    - name: test to configure
+      eos_config:
+        src: config_router
+        
+    - name: diff against a provided master config
+      eos_config:
+        diff_against: running

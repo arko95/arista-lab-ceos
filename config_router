@@ -1,0 +1,14 @@
+aaa authorization exec default local
+!
+interface Ethernet1
+   no switchport
+!
+interface Ethernet2
+   no switchport
+!
+interface Ethernet3
+   no switchport
+!
+ip routing
+!
+router bgp 65001

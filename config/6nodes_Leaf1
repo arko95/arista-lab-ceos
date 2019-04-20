@@ -7,6 +7,8 @@ hostname Leaf1-SW
 !
 spanning-tree mode mstp
 !
+aaa authorization exec default local
+!
 no aaa root
 !
 username arista privilege 15 secret sha512 $6$8WjBPcdTymcecVGK$xilaY1hwaUZb4JmkF5hTD7mAhB/yTZs/KLh.KxVhvyQ6l3oVuZIP6We.DH4Fl4z1pz9UQcChDjqJTWOMSWMUN1
@@ -18,12 +20,17 @@ vlan 20
    name production
 !
 interface Ethernet1
+   no switchport
 !
 interface Ethernet2
+   no switchport
 !
 interface Ethernet3
+   no switchport
 !
-no ip routing
+ip routing
+!
+router bgp 65001
 !
 management api http-commands
    no shutdown
